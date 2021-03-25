@@ -20,13 +20,26 @@ package kubectl
 
 import (
 	"fmt"
+	"io/ioutil"
+	"path/filepath"
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
+
+	"github.com/fidelity/kraan/pkg/logging"
+)
+
+const (
+	kustomizeYaml = "kustomization.yaml"
 )
 
 var (
-	kubectlCmd = "kubectl"
+	kubectlCmd          = "kubectl"
+	kustomizeCmd        = "kustomize"
+	applyArgs           = []string{"-R", "-f"}
+	newExecProviderFunc = newExecProvider
+	tempDirProviderFunc = createTempDir
 )
 
 // Kubectl is a Factory interface that returns concrete Command implementations from named constructors.
@@ -36,6 +49,23 @@ type Kubectl interface {
 	Get(args ...string) (c Command)
 }
 
+// Kustomize is a Factory interface that returns concrete Command implementations from named constructors.
+type Kustomize interface {
+	Build(path string) (c Command)
+}
+
+// NewKubectl returns a Kubectl object for creating and running kubectl sub-commands.
+func NewKubectl(logger logr.Logger) (kubectl Kubectl, err error) {
+	execProvider := newExecProviderFunc()
+	return newCommandFactory(logger, execProvider, kubectlCmd)
+}
+
+// NewKustomize returns a Kustomize object for creating and running Kustomize sub-commands.
+func NewKustomize(logger logr.Logger) (kustomize Kustomize, err error) {
+	execProvider := newExecProviderFunc()
+	return newCommandFactory(logger, execProvider, kustomizeCmd)
+}
+
 // CommandFactory is a concrete Factory implementation of the Kubectl interface's API.
 type CommandFactory struct {
 	logger       logr.Logger
@@ -43,22 +73,16 @@ type CommandFactory struct {
 	execProvider ExecProvider
 }
 
-// NewKubectl returns a Kubectl object for creating and running kubectl sub-commands.
-func NewKubectl(logger logr.Logger) (kubectl Kubectl, err error) {
-	execProvider := newExecProvider()
-	return newCommandFactory(logger, execProvider)
-}
-
-func newCommandFactory(logger logr.Logger, execProvider ExecProvider) (factory *CommandFactory, err error) {
+func newCommandFactory(logger logr.Logger, execProvider ExecProvider, execProg string) (factory *CommandFactory, err error) {
 	factory = &CommandFactory{
 		logger:       logger,
 		execProvider: execProvider,
 	}
-	factory.path, err = factory.getExecProvider().FindOnPath(kubectlCmd)
+	factory.path, err = factory.getExecProvider().FindOnPath(execProg)
 	if err != nil {
-		err = fmt.Errorf("unable to find %s binary on system PATH: %w", kubectlCmd, err)
+		return nil, errors.Wrapf(err, "%s - unable to find %s binary on system PATH", logging.CallerStr(logging.Me), execProg)
 	}
-	return factory, err
+	return factory, nil
 }
 
 func (f CommandFactory) getLogger() logr.Logger {
@@ -76,6 +100,7 @@ func (f CommandFactory) getExecProvider() ExecProvider {
 // Command defines an interface for commands created by the Kubectl factory type.
 type Command interface {
 	Run() (output []byte, err error)
+	Build() (buildDir string)
 	DryRun() (output []byte, err error)
 	WithLogger(logger logr.Logger) (self Command)
 	getPath() string
@@ -96,13 +121,13 @@ type abstractCommand struct {
 	output     []byte
 }
 
-func (c *abstractCommand) logInfo(msg string, keysAndValues ...interface{}) {
-	c.logger.V(1).Info(msg, append(keysAndValues, "command", c.asString())...)
+func (c *abstractCommand) logDebug(msg string, keysAndValues ...interface{}) {
+	c.logger.V(1).Info(msg, append(keysAndValues, append(logging.GetFunctionAndSource(logging.MyCaller+1), "command", c.asString())...)...)
 }
 
 func (c *abstractCommand) logError(sourceErr error, keysAndValues ...interface{}) (err error) {
 	msg := "error executing kubectl command"
-	c.logger.Error(err, msg, append(keysAndValues, "command", c.asString())...)
+	c.logger.Error(err, msg, append(keysAndValues, append(logging.GetFunctionAndSource(logging.MyCaller+1), "command", c.asString())...)...)
 	return fmt.Errorf("%s '%s' : %w", msg, c.asString(), sourceErr)
 }
 
@@ -131,20 +156,50 @@ func (c *abstractCommand) asString() (cmdString string) {
 
 // Run executes the Kubectl command with all its arguments and returns the output.
 func (c *abstractCommand) Run() (output []byte, err error) {
+	logging.TraceCall(c.logger)
+	defer logging.TraceExit(c.logger)
 	if c.jsonOutput {
 		c.args = append(c.args, "-o", "json")
 	}
-	c.logInfo("executing kubectl")
+	c.logDebug("executing kubectl")
 	c.output, err = c.factory.getExecProvider().ExecCmd(c.getPath(), c.getArgs()...)
 	if err != nil {
-		err = c.logError(err)
+		return nil, errors.WithMessagef(err, "%s - failed to execute kubectl", logging.CallerStr(logging.Me))
 	}
-	return c.output, err
+	return c.output, nil
+}
+
+// createTempDir creates a temporary directory.
+func createTempDir() (buildDir string, err error) {
+	buildDir, err = ioutil.TempDir("", "build-*")
+	if err != nil {
+		return "", errors.WithMessagef(err, "%s - failed to create temporary directory", logging.CallerStr(logging.Me))
+	}
+	return buildDir, nil
+}
+
+// Build executes the Kustomize command with all its arguments and returns the output.
+func (c *abstractCommand) Build() (buildDir string) {
+	logging.TraceCall(c.logger)
+	defer logging.TraceExit(c.logger)
+	var err error
+	buildDir, err = tempDirProviderFunc()
+	if err != nil {
+		c.logError(err) // nolint:errcheck //ok
+		return buildDir
+	}
+	c.args = append(c.args, "-o", buildDir)
+	c.logDebug("executing kustomize build")
+	c.output, err = c.factory.getExecProvider().ExecCmd(c.getPath(), c.getArgs()...)
+	if err != nil {
+		c.logError(err) // nolint:errcheck //ok
+	}
+	return buildDir
 }
 
 // DryRun executes the Kubectl command as a dry run and returns the output without making any changes to the cluster.
 func (c *abstractCommand) DryRun() (output []byte, err error) {
-	c.args = append(c.args, "--dry-run")
+	c.args = append(c.args, "--server-dry-run")
 	return c.Run()
 }
 
@@ -161,18 +216,61 @@ type ApplyCommand struct {
 	abstractCommand
 }
 
+// BuildCommand is a kustomize sub-command that processes a kustomization.yaml file.
+type BuildCommand struct {
+	abstractCommand
+}
+
+func (f *CommandFactory) kustomizationBuiler(path string, log logr.Logger) string {
+	logging.TraceCall(f.logger)
+	defer logging.TraceExit(f.logger)
+	kustomize, err := NewKustomize(log)
+	if err != nil {
+		log.Error(err, "failed to create kustomize command object", logging.GetFunctionAndSource(logging.MyCaller)...)
+		return path
+	}
+	return kustomize.Build(path).Build()
+}
+
+// Build instantiates an BuildCommand instance using the provided directory path.
+func (f *CommandFactory) Build(path string) (c Command) {
+	logging.TraceCall(f.logger)
+	defer logging.TraceExit(f.logger)
+	c = &BuildCommand{
+		abstractCommand: abstractCommand{
+			logger:     f.logger,
+			factory:    f,
+			subCmd:     "build",
+			jsonOutput: true,
+			args:       []string{path},
+		},
+	}
+	return c
+}
+
 // Apply instantiates an ApplyCommand instance using the provided directory path.
 func (f *CommandFactory) Apply(path string) (c Command) {
+	logging.TraceCall(f.logger)
+	defer logging.TraceExit(f.logger)
+	if f.isKustomization(path) {
+		path = f.kustomizationBuiler(path, f.logger)
+	}
 	c = &ApplyCommand{
 		abstractCommand: abstractCommand{
 			logger:     f.logger,
 			factory:    f,
 			subCmd:     "apply",
 			jsonOutput: true,
-			args:       []string{"-R", "-f", path},
+			args:       append(applyArgs, path),
 		},
 	}
 	return c
+}
+
+func (f *CommandFactory) isKustomization(dir string) bool {
+	logging.TraceCall(f.logger)
+	defer logging.TraceExit(f.logger)
+	return f.getExecProvider().FileExists(filepath.Join(dir, kustomizeYaml))
 }
 
 // DeleteCommand implements the Command interface to delete resources from the KubeAPI service.
@@ -182,6 +280,8 @@ type DeleteCommand struct {
 
 // Delete instantiates a DeleteCommand instance for the described Kubernetes resource.
 func (f *CommandFactory) Delete(args ...string) (c Command) {
+	logging.TraceCall(f.logger)
+	defer logging.TraceExit(f.logger)
 	c = &DeleteCommand{
 		abstractCommand: abstractCommand{
 			logger:     f.logger,
@@ -201,6 +301,8 @@ type GetCommand struct {
 
 // Get instantiates a GetCommand instance for the described Kubernetes resource
 func (f *CommandFactory) Get(args ...string) (c Command) {
+	logging.TraceCall(f.logger)
+	defer logging.TraceExit(f.logger)
 	c = &GetCommand{
 		abstractCommand: abstractCommand{
 			logger:     f.logger,

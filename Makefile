@@ -8,13 +8,6 @@ ifeq (,$(strip ${GOBIN}))
 GOBIN := $(shell go env GOPATH)/bin
 endif
 
-TOOLS_DIR := hack/tools
-TOOLS_BIN_DIR := $(TOOLS_DIR)/bin
-BIN_DIR := bin
-
-# Binaries
-GOLANGCI_LINT := $(abspath $(TOOLS_BIN_DIR)/golangci-lint)
-
 .DEFAULT_GOAL := all
 
 include project-name.mk
@@ -26,11 +19,25 @@ MAKE_SOURCES:=makefile.mk project-name.mk Makefile
 PROJECT_SOURCES:=$(shell find ./main ./controllers/ ./api/ ./pkg/ -regex '.*.\.\(go\|json\)$$')
 
 BUILD_DIR:=build/
+RELEASE_DIR:=$(shell mktemp -d)
 GITHUB_USER?=$(shell git config --local  user.name)
-export VERSION?=latest
-export REPO ?=ghcr.io/${GITHUB_USER}/
+GITHUB_ORG=$(shell git config --get remote.origin.url | sed -nr '/github.com/ s/.*github.com([^"]+).*/\1/p' | cut --characters=2- | cut -f1 -d/)
+GITHUB_REPO=$(shell git config --get remote.origin.url | sed -nr '/github.com/ s/.*github.com([^"]+).*/\1/p'| cut --characters=2- | cut -f2 -d/ | cut -f1 -d.)
+GIT_BRANCH=$(shell git rev-parse --abbrev-ref HEAD)
+export VERSION?=$(shell cat VERSION)
+export REPO ?=docker.pkg.github.com/${GITHUB_ORG}/${GITHUB_REPO}
 # Image URL to use all building/pushing image targets
-IMG ?= ${REPO}${ORG}/${PROJECT}:${VERSION}
+IMG ?= ${REPO}/${PROJECT}:${VERSION}
+export CHART_VERSION?=$(shell grep version: chart/Chart.yaml | awk '{print $$2}')
+export CHART_APP_VERSION?=$(shell grep appVersion: chart/Chart.yaml | awk '{print $$2}')
+
+# Controller Integration test setup
+export USE_EXISTING_CLUSTER?=true
+export ZAP_LOG_LEVEL?=0
+export KRAAN_NAMESPACE?=gotk-system
+export KUBECONFIG?=${HOME}/.kube/config
+export DATA_PATH?=$(shell mktemp -d -t kraan-XXXXXXXXXX)
+export SC_HOST?=localhost:8090
 
 ALL_GO_PACKAGES:=$(shell find ${CURDIR}/main/ ${CURDIR}/controllers/ ${CURDIR}/api/ ${CURDIR}/pkg/ \
 	-type f -name *.go -exec dirname {} \; | sort --uniq)
@@ -39,6 +46,7 @@ GO_CHECK_PACKAGES:=$(shell echo $(subst $() $(),\\n,$(ALL_GO_PACKAGES)) | \
 
 CHECK_ARTIFACT:=${BUILD_DIR}${PROJECT}-check-${VERSION}-docker.tar
 BUILD_ARTIFACT:=${BUILD_DIR}${PROJECT}-build-${VERSION}-docker.tar
+DEV_BUILD_ARTIFACT:=${BUILD_DIR}${PROJECT}-dev-build-${VERSION}-docker.tar
 
 GOMOD_CACHE_ARTIFACT:=${GOMOD_CACHE_DIR}._gomod
 GOMOD_ARTIFACT:=_gomod
@@ -52,23 +60,27 @@ NC:=\033[0m
 
 # Targets that do not represent filenames need to be registered as phony or
 # Make won't always rebuild them.
-.PHONY: all clean ci-check ci-gate clean-godocs go-generate \
-	godocs clean-gomod gomod gomod-update \
+.PHONY: all clean ci-check ci-gate go-generate \
+	clean-gomod gomod gomod-update release \
 	clean-${PROJECT}-check ${PROJECT}-check clean-${PROJECT}-build \
 	${PROJECT}-build ${GO_CHECK_PACKAGES} clean-check check \
 	clean-build build generate manifests deploy docker-push controller-gen \
-	install uninstall lint-build run
+	install uninstall lint-build run ${PROJECT}-integration integration clean-integration docker-push-prerelease
 # Stop prints each line of the recipe.
 .SILENT:
 
 # Allow secondary expansion of explicit rules.
 .SECONDEXPANSION: %.md %-docker.tar
 
-all: ${PROJECT}-check ${PROJECT}-build #go-generate
+all: go-generate ${PROJECT}-check ${PROJECT}-build
 build: gomod ${PROJECT}-check ${PROJECT}-build
-clean: clean-gomod clean-godocs clean-${PROJECT}-check \
+dev-build: gomod ${PROJECT}-check integration ${PROJECT}-build
+integration: gomod ${PROJECT}-integration
+clean-integration: clean-${PROJECT}-integration
+clean: clean-gomod clean-${PROJECT}-check \
 	clean-${PROJECT}-build clean-check clean-build \
-	clean-${BUILD_DIR}
+	clean-dev-build clean-builddir-${BUILD_DIR} mkdir-${BUILD_DIR} \
+	clean-integration
 
 
 # Specific CI targets.
@@ -77,21 +89,29 @@ clean: clean-gomod clean-godocs clean-${PROJECT}-check \
 ci-check: check build
 	$(MAKE) -C build
 
-clean-${BUILD_DIR}:
+clean-builddir-${BUILD_DIR}:
 	rm -rf ${BUILD_DIR}
 
-${BUILD_DIR}:
-	mkdir -p $@
+mkdir-${BUILD_DIR}:
+	mkdir -p ${BUILD_DIR}
 
-clean-godocs:
-	rm -f ${GO_DOCS_ARTIFACTS}
+validate-versions:
+	./scripts/validate.sh
 
-godocs: ${GO_DOCS_ARTIFACTS}
-%.md: $$(wildcard $$(dir $$@)*.go | grep -v suite_test)
-	echo "${YELLOW}Running godocdown: $@${NC}" && \
-	godocdown -output $@ $(shell dirname $@)
+release:
+	cp -rf docs ${RELEASE_DIR}  || exit
+	cp -f *.md ${RELEASE_DIR}  || exit
+	helm package --version ${CHART_VERSION} chart  || exit
+	mv kraan-controller-${CHART_VERSION}.tgz ${RELEASE_DIR} || exit
+	git checkout -B gh-pages --track origin/gh-pages || exit
+	cp -rf ${RELEASE_DIR}/* . || exit
+	rm -rf ${RELEASE_DIR} || exit
+	helm repo index --url https://fidelity.github.io/kraan/ .  || exit
+	git commit -a -m "release chart version ${CHART_VERSION}"  || exit
+	git push  || exit
+	git checkout ${GIT_BRANCH}  || exit
 
-
+clean-gomod:
 clean-gomod:
 	rm -rf ${GOMOD_ARTIFACT}
 
@@ -105,15 +125,28 @@ go.sum:  ${GOMOD_ARTIFACT}
 
 ${GOMOD_ARTIFACT}: gomod-update
 gomod-update: go.mod ${PROJECT_SOURCES}
-	go build ./...
+	go build ./... && \
+	echo "${YELLOW}go mod tidy${NC}" && \
+	go mod tidy && \
+	echo "${YELLOW}go mod download${NC}" && \
+	go mod download
 
 clean-${PROJECT}-check:
-	$(foreach target,${GO_CHECK_PACKAGES},
+	$(foreach target,${GO_CHECK_PACKAGES}, \
 		$(MAKE) -C ${target} --makefile=${CURDIR}/makefile.mk clean;)
 
 ${PROJECT}-check: ${GO_CHECK_PACKAGES}
 ${GO_CHECK_PACKAGES}: go.sum
 	$(MAKE) -C $@ --makefile=${CURDIR}/makefile.mk
+
+clean-${PROJECT}-integration:
+	$(foreach target,${GO_CHECK_PACKAGES}, \
+		$(MAKE) -C ${target} --makefile=${CURDIR}/makefile.mk clean-integration;)
+
+${PROJECT}-integration: ${GO_CHECK_PACKAGES}
+	$(foreach target,${GO_CHECK_PACKAGES}, \
+		$(MAKE) -C ${target} \
+			--makefile=${CURDIR}/makefile.mk integration || exit;)
 
 # Generate code
 go-generate: ${PROJECT_SOURCES}
@@ -134,18 +167,17 @@ ${GO_BIN_ARTIFACT}: go.sum ${MAKE_SOURCES} ${PROJECT_SOURCES}
 clean-check:
 	rm -f ${CHECK_ARTIFACT}
 
-check: DOCKER_SOURCES=Dockerfile ${MAKE_SOURCES} ${PROJECT_SOURCES}
-check: DOCKER_BUILD_OPTIONS=--target builder --build-arg VERSION
-check: TAG=${REPO}${ORG}/${PROJECT}-check:${VERSION}
-check: ${BUILD_DIR} ${CHECK_ARTIFACT}
+check: DOCKER_SOURCES=Dockerfile-check ${MAKE_SOURCES} ${PROJECT_SOURCES}
+check: DOCKER_BUILD_OPTIONS=--target builder --no-cache
+check: IMG=${PROJECT}-check:${VERSION}
+check: mkdir-${BUILD_DIR} ${CHECK_ARTIFACT}
 
 clean-build:
 	rm -f ${BUILD_ARTIFACT}
 
 build: DOCKER_SOURCES=Dockerfile ${MAKE_SOURCES} ${PROJECT_SOURCES}
-build: DOCKER_BUILD_OPTIONS=--build-arg VERSION
-build: IMG=${REPO}${ORG}/${PROJECT}:${VERSION}
-build: ${BUILD_DIR} ${BUILD_ARTIFACT}
+build: IMG=${REPO}/${PROJECT}:${VERSION}
+build: mkdir-${BUILD_DIR} ${BUILD_ARTIFACT}
 
 %-docker.tar: $${DOCKER_SOURCES}
 	docker build --rm --pull=true \
@@ -156,9 +188,21 @@ build: ${BUILD_DIR} ${BUILD_ARTIFACT}
 		. && \
 	docker save --output $@ ${IMG}
 
-lint-build: 
-$(GOLANGCI_LINT): $(TOOLS_DIR)/go.mod # Build golangci-lint from tools folder
-	cd $(TOOLS_DIR); go build -tags=tools -o $(BIN_DIR)/golangci-lint github.com/golangci/golangci-lint/cmd/golangci-lint
+clean-dev-build:
+	rm -f ${DEV_BUILD_ARTIFACT}
+
+dev-build: DOCKER_SOURCES=Dockerfile-dev ${MAKE_SOURCES} ${PROJECT_SOURCES}
+dev-build: IMG=${REPO}/${PROJECT}-prerelease:${VERSION}
+dev-build: mkdir-${BUILD_DIR} ${DEV_BUILD_ARTIFACT}
+
+%-docker.tar: $${DOCKER_SOURCES}
+	docker build --rm --pull=true \
+		${DOCKER_BUILD_OPTIONS} \
+		${DOCKER_BUILD_PROXYS} \
+		--tag ${IMG} \
+		--file $< \
+		. && \
+	docker save --output $@ ${IMG}
 
 # Run against the configured Kubernetes cluster in ~/.kube/config
 run: ${PROJECT}-build
@@ -186,6 +230,8 @@ generate: controller-gen
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
 # Push the docker image
+docker-push-prerelease:
+	docker push ${REPO}/${PROJECT}-prerelease:${VERSION}
 docker-push:
 	docker push ${IMG}
 
@@ -198,7 +244,7 @@ ifeq (, $(shell which controller-gen))
 	CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
 	cd $$CONTROLLER_GEN_TMP_DIR ;\
 	go mod init tmp ;\
-	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.2.5 ;\
+	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.4.1 ;\
 	rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
 	}
 CONTROLLER_GEN=$(GOBIN)/controller-gen

@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Set versions of software required
-linter_version=1.30.0
-golang_version=1.14.6
+linter_version=1.38.0
+kubebuilder_version=2.3.1
+mockgen_version=v1.4.4
+helm_version=v3.3.4
+kind_version=v0.9.0
+kubectl_version=v1.17.12
+kustomize_version=v3.8.5
 
 function usage()
 {
@@ -21,94 +26,178 @@ function args() {
 }
 
 function install_linter() {
-    curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh| sh -s -- -b "${PROJECT_BIN_ROOT}" v${linter_version}
+    TARGET=$(go env GOPATH)
+    curl -sfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh| sh -s -- -b "${TARGET}/bin" v${linter_version}
 }
 
-function install_golang() {
-    echo "Installing golang version: ${golang_version}"
-    # shellcheck disable=SC2164
-    pushd /tmp >/dev/null
-    # shellcheck disable=SC1090
-    # shellcheck disable=SC2164
-    curl -qL -O "https://storage.googleapis.com/golang/go${golang_version}.linux-amd64.tar.gz" &&
-      tar xfa go${golang_version}.linux-amd64.tar.gz &&
-      rm -rf "${PROJECT_BIN_ROOT}/go" &&
-      mv go "${PROJECT_BIN_ROOT}" &&
-      source "${SCRIPT_DIR}/env.sh" &&
-    popd >/dev/null
+function install_kubebuilder() {
+    os=$(go env GOOS)
+    arch=$(go env GOARCH)
 
-    # shellcheck disable=SC2164
-    pushd "${GOROOT}/src/go/types" > /dev/null
-    echo "Installing gotype linter"
-    go build gotype.go
-    cp gotype "${GOBIN}"
-    # shellcheck disable=SC2164
-    popd >/dev/null
+    # download kubebuilder and extract it to tmp
+    curl -L https://go.kubebuilder.io/dl/${kubebuilder_version}/${os}/${arch} | tar -xz -C /tmp/
+
+    # move to a long-term location and put it on your path
+    # (you'll need to set the KUBEBUILDER_ASSETS env var if you put it somewhere else)
+    $sudo mv /tmp/kubebuilder_${kubebuilder_version}_${os}_${arch} /usr/local/kubebuilder
+    echo "add the following to your bash profile"
+    echo "export PATH=\$PATH:/usr/local/kubebuilder/bin"
 }
 
-function install_godocdown() {
-    echo "installing godocdown"
-    go get github.com/robertkrimen/godocdown/godocdown
+function install_helm() {
+    curl -L https://get.helm.sh/helm-${helm_version}-linux-amd64.tar.gz | tar -xz -C /tmp/
+    $sudo mv /tmp/linux-amd64/helm /usr/local/bin
 }
 
-function make_local() {
-    if [ ! -d "${PROJECT_BIN_ROOT}" ] ; then
-        echo "Creating directory for ${PROJECT_NAME} software in ${PROJECT_BIN_ROOT}"
-        mkdir -p "${PROJECT_BIN_ROOT}"
-    fi
-    # shellcheck disable=SC1090
-    source "${SCRIPT_DIR}/env.sh"
+function install_kind() {
+    curl -Lo ./kind https://kind.sigs.k8s.io/dl/${kind_version}/kind-linux-amd64
+    chmod 755 kind
+    $sudo mv kind /usr/local/bin
 }
 
-SCRIPT_DIR="$(readlink -f "$(dirname "${0}")")"
-# shellcheck disable=SC1090
-if ! source "${SCRIPT_DIR}/env.sh"; then
-    exit 1
-fi
+function install_kubectl() {
+    curl -LO https://storage.googleapis.com/kubernetes-release/release/${kubectl_version}/bin/linux/amd64/kubectl
+    chmod +x ./kubectl
+    $sudo mv kubectl /usr/local/bin
+}
+
+function install_kustomize() {
+    curl -LO https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v3.8.5/kustomize_${kustomize_version}_linux_amd64.tar.gz
+    tar xzf ./kustomize_${kustomize_version}_linux_amd64.tar.gz
+    chmod +x ./kustomize
+    $sudo mv kustomize /usr/local/bin
+}
 
 args "${@}"
 
-echo "Running setup script to setup software for ${PROJECT_NAME}"
+sudo -E env >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    sudo="sudo -E"
+fi
 
-# Remove any legacy installs
-rm -rf "${PROJECT_DIR}/bin/local"
-
-make_local
+echo "Running setup script to setup software"
 
 golangci-lint --version 2>&1 | grep $linter_version >/dev/null
 ret_code="${?}"
-if [[ "${ret_code}" != "0" || ! -e "${PROJECT_BIN_ROOT}/golangci-lint" ]] ; then
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing linter version: ${linter_version}"
     install_linter
     golangci-lint --version 2>&1 | grep $linter_version >/dev/null
     ret_code="${?}"
     if [ "${ret_code}" != "0" ] ; then
         echo "Failed to install linter"
+        echo "version: `golangci-lint --version`"
+        echo "expecting: $linter_version"
         exit 1
     fi
+else
+    echo "linter version: `golangci-lint --version`"
 fi
 
-go version 2>&1 | grep $golang_version >/dev/null
+export PATH=$PATH:/usr/local/kubebuilder/bin
+kubebuilder version 2>&1 | grep ${kubebuilder_version} >/dev/null
 ret_code="${?}"
-if [[ "${ret_code}" != "0"  || "${GOROOT}" != "${PROJECT_BIN_ROOT}/go" ]] ; then
-    install_golang
-    go version 2>&1 | grep $golang_version >/dev/null
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing kubebuilder version: ${kubebuilder_version}"
+    install_kubebuilder
+    kubebuilder version 2>&1 | grep ${kubebuilder_version} >/dev/null
     ret_code="${?}"
     if [ "${ret_code}" != "0" ] ; then
-        echo "Failed to install golang"
+        echo "Failed to install kubebuilder"
         exit 1
     fi
+else
+   echo "kubebuilder version: `kubebuilder version`"     
 fi
 
-godocdown >/dev/null 2>&1
+mockgen -version 2>&1 | grep ${mockgen_version} >/dev/null
 ret_code="${?}"
-if [[ "${ret_code}" == "127" || "${GOBIN}" != "${PROJECT_BIN_ROOT}" ]] ; then
-    install_godocdown
-    godocdown >/dev/null 2>&1
-    if [ "$?" == "127" ] ; then
-        echo "Failed to install godocdown"
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing mockgen version: ${mockgen_version}"
+    GO111MODULE=on go get github.com/golang/mock/mockgen@${mockgen_version}
+    mockgen -version 2>&1 | grep ${mockgen_version} >/dev/null
+    ret_code="${?}"
+    if [ "${ret_code}" != "0" ] ; then
+        echo "Failed to install helm"
         exit 1
     fi
+else
+    echo "mockgen version: `mockgen -version`"
 fi
 
-echo "Installing latest version of gitops toolkit cli"
-curl -s https://toolkit.fluxcd.io/install.sh | sudo -E bash
+flux --version >/dev/null 2>&1 
+ret_code="${?}"
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "Installing latest version of flux cli"
+    curl -s https://toolkit.fluxcd.io/install.sh | $sudo bash
+    flux --version >/dev/null 2>&1 
+    ret_code="${?}"
+    if [ "${ret_code}" != "0" ] ; then
+        echo "Failed to install flux"
+        exit 1
+    fi
+else
+    echo "flux version: `flux --version`"
+fi
+
+helm version 2>&1 | grep ${helm_version} >/dev/null
+ret_code="${?}"
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing helm version: ${helm_version}"
+    install_helm
+    helm version 2>&1 | grep ${helm_version} >/dev/null
+    ret_code="${?}"
+    if [ "${ret_code}" != "0" ] ; then
+        echo "Failed to install helm"
+        exit 1
+    fi
+else
+    echo "helm version: `helm version`"
+fi
+
+kind version 2>&1 | grep ${kind_version} >/dev/null
+ret_code="${?}"
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing kind version: ${kind_version}"
+    install_kind
+    kind version 2>&1 | grep ${kind_version} >/dev/null
+    ret_code="${?}"
+    if [ "${ret_code}" != "0" ] ; then
+        echo "Failed to install kind"
+        exit 1
+    fi
+else
+    echo "kind version: `kind version`"
+fi
+
+kubectl version --client 2>&1 | grep ${kubectl_version} >/dev/null
+ret_code="${?}"
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing kubectl version: ${kubectl_version}"
+    install_kubectl
+    kubectl version --client 2>&1 | grep ${kubectl_version} >/dev/null
+    ret_code="${?}"
+    if [ "${ret_code}" != "0" ] ; then
+        echo "kubectl version, required: ${kubectl_version}, actual: `kubectl version --client`"
+        echo "Failed to install kubectl"
+        exit 1
+    fi
+else
+    echo "kubectl version: `kubectl version --client`"
+fi
+
+kustomize version 2>&1 | grep ${kustomize_version} >/dev/null
+ret_code="${?}"
+if [[ "${ret_code}" != "0" ]] ; then
+    echo "installing kustomize version: ${kustomize_version}"
+    install_kustomize
+    kustomize version 2>&1 | grep ${kustomize_version} >/dev/null
+    ret_code="${?}"
+    if [ "${ret_code}" != "0" ] ; then
+        echo "kustomize version, required: ${kustomize_version}, actual: `kustomize version`"
+        echo "Failed to install kustomize"
+        exit 1
+    fi
+else
+    echo "kustomize version: `kustomize version`"
+fi
