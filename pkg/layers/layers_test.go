@@ -7,58 +7,85 @@ import (
 	"io/ioutil"
 	"testing"
 
-	kraanv1alpha1 "github.com/fidelity/kraan/api/v1alpha1"
-	"github.com/fidelity/kraan/pkg/layers"
-
+	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
 	"github.com/go-logr/logr"
-	testlogr "github.com/go-logr/logr/testing"
-	"github.com/paulcarlton-ww/go-utils/pkg/goutils"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/version"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	fakeK8s "k8s.io/client-go/kubernetes/fake"
 	fakeTest "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 
 	//k8sscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	extv1b1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake" // nolint: staticcheck // ok for now
+
+	kraanv1alpha1 "github.com/fidelity/kraan/api/v1alpha1"
+	"github.com/fidelity/kraan/pkg/internal/testutils"
+	"github.com/fidelity/kraan/pkg/layers"
 )
 
 var (
 	testScheme = runtime.NewScheme()
 	// testCtx    = context.Background()
 	fakeK8sClient *fakeK8s.Clientset
+	scheme        = runtime.NewScheme()
 )
 
+func init() {
+	_ = corev1.AddToScheme(scheme) // nolint:errcheck // ok
+	//_ = helmctlv2.AddToScheme(scheme)     // nolint:errcheck // ok
+	_ = kraanv1alpha1.AddToScheme(scheme) // nolint:errcheck // ok
+	_ = sourcev1.AddToScheme(scheme)      // nolint:errcheck // ok
+	_ = extv1b1.AddToScheme(scheme)       // nolint:errcheck // ok
+}
+
 const (
-	holdSet      = "hold-set"
-	k8sPending   = "k8s-pending"
-	emptyStatus  = "empty-status"
-	noDepends    = "no-depends"
-	oneDepends   = "one-depends"
-	oneDependsV2 = "one-depends-v2"
-	twoDepends   = "two-depends"
-	k8sv16       = "k8s-v16"
-	k8sv16_2     = "k8s-v16-2"
+	holdSet       = "hold-set"
+	k8sPending    = "k8s-pending"
+	emptyStatus   = "empty-status"
+	noDepends     = "no-depends"
+	oneDepends    = "one-depends"
+	oneDependsG   = "one-dependsG"
+	oneDependsSG  = "one-dependsSG"
+	oneDependsSR  = "one-dependsSR"
+	oneDependsSNR = "one-dependsSNR"
+	oneDependsND  = "one-depends-not-deployed"
+	oneDependsV2  = "one-depends-v2"
+	twoDepends    = "two-depends"
+	k8sv16        = "k8s-v16"
+	k8sv16_2      = "k8s-v16-2"
 	//maxConditions = "max-conditions"
 	layersData  = "testdata/layersdata.json"
+	reposData   = "testdata/reposdata.json"
 	versionOne  = "0.1.01"
 	layersData1 = "testdata/layersdata1.json"
 	layersData2 = "testdata/layersdata2.json"
 )
 
 func init() {
-	_ = corev1.AddToScheme(testScheme) // nolint:errcheck // ok
-	//_ = k8sscheme.AddToScheme(testScheme)     // nolint:errcheck // ok
+	_ = corev1.AddToScheme(testScheme)        // nolint:errcheck // ok
+	_ = sourcev1.AddToScheme(testScheme)      // nolint:errcheck // ok
 	_ = kraanv1alpha1.AddToScheme(testScheme) // nolint:errcheck // ok
-}
-
-func fakeLogger() logr.Logger {
-	return testlogr.NullLogger{}
 }
 
 func TestCreateLayer(t *testing.T) {
 
+}
+
+func getGitReposFromFile(fileName string) (*sourcev1.GitRepositoryList, error) {
+	buffer, err := ioutil.ReadFile(fileName)
+	if err != nil {
+		return nil, err
+	}
+	gitRepos := &sourcev1.GitRepositoryList{}
+	err = json.Unmarshal(buffer, gitRepos)
+	if err != nil {
+		return nil, err
+	}
+	return gitRepos, nil
 }
 
 func getLayersFromFile(fileName string) (*kraanv1alpha1.AddonsLayerList, error) {
@@ -83,19 +110,24 @@ func getFromList(name string, layerList *kraanv1alpha1.AddonsLayerList) *kraanv1
 	return nil
 }
 
-func getLayer(layerName, testDataFileName string) (layers.Layer, error) {
-	logger := fakeLogger()
+func getLayer(layerName, testDataFileName, reposDataFileName string) (layers.Layer, error) { // nolint: unparam // ok
+	logger := logr.Discard()
 	layerList, err := getLayersFromFile(testDataFileName)
 	if err != nil {
 		return nil, err
 	}
-	client := fake.NewFakeClientWithScheme(testScheme, layerList)
+	gitReposList, err := getGitReposFromFile(reposDataFileName)
+	if err != nil {
+		return nil, err
+	}
+	client := fake.NewFakeClientWithScheme(testScheme, layerList, gitReposList)
 	fakeK8sClient = fakeK8s.NewSimpleClientset()
 	data := getFromList(layerName, layerList)
 	if data == nil {
 		return nil, fmt.Errorf("failed to find item: %s in test data", layerName)
 	}
-	return layers.CreateLayer(context.Background(), client, fakeK8sClient, logger, data), nil
+	fakeRecorder := record.NewFakeRecorder(1000)
+	return layers.CreateLayer(context.Background(), client, fakeK8sClient, logger, fakeRecorder, scheme, data), nil
 }
 
 func testDelayedRequeue(t *testing.T, l layers.Layer) bool {
@@ -125,7 +157,7 @@ func testDelayedRequeue(t *testing.T, l layers.Layer) bool {
 }
 
 func TestSetDelayedRequeue(t *testing.T) {
-	l, e := getLayer(emptyStatus, layersData)
+	l, e := getLayer(emptyStatus, layersData, reposData)
 	if e != nil {
 		t.Fatalf("failed to create layer, error: %s", e.Error())
 	}
@@ -156,7 +188,7 @@ func testRequeue(t *testing.T, l layers.Layer) bool {
 }
 
 func TestSetRequeue(t *testing.T) {
-	l, e := getLayer(emptyStatus, layersData)
+	l, e := getLayer(emptyStatus, layersData, reposData)
 	if e != nil {
 		t.Fatalf("failed to create layer, error: %s", e.Error())
 	}
@@ -187,7 +219,7 @@ func testUpdated(t *testing.T, l layers.Layer) bool {
 }
 
 func TestSetUpdated(t *testing.T) {
-	l, e := getLayer(emptyStatus, layersData)
+	l, e := getLayer(emptyStatus, layersData, reposData)
 	if e != nil {
 		t.Fatalf("failed to create layer, error: %s", e.Error())
 	}
@@ -199,7 +231,7 @@ func TestSetUpdated(t *testing.T) {
 	}
 }
 
-func compareConditions(actual, expected []kraanv1alpha1.Condition) error {
+func compareConditions(actual, expected []metav1.Condition) error {
 	if len(actual) != len(expected) {
 		return fmt.Errorf("mismatch in number of conditions")
 	}
@@ -221,20 +253,16 @@ func compareConditions(actual, expected []kraanv1alpha1.Condition) error {
 			return fmt.Errorf("mismatch in condition: %d, type..\nActual: %s\nExpected: %s",
 				index, condition.Type, expect.Type)
 		}
-		if condition.Version != expect.Version {
-			return fmt.Errorf("mismatch in condition: %d, version...\nActual: %s\nExpected: %s",
-				index, condition.Version, expect.Version)
-		}
 	}
 	return nil
 }
 
 func resetConditions(l layers.Layer) {
-	l.GetFullStatus().Conditions = []kraanv1alpha1.Condition{}
+	l.GetFullStatus().Conditions = []metav1.Condition{}
 }
 
 func displayStatus(status *kraanv1alpha1.AddonsLayerStatus) string {
-	statusJSON, err := goutils.ToJSON(status)
+	statusJSON, err := testutils.ToJSON(status)
 	if err != nil {
 		return fmt.Sprintf("failed to generate json output for actual result, error: %s", err.Error())
 	}
@@ -263,7 +291,7 @@ func TestSetStatusSetting(t *testing.T) { // nolint:funlen // ok
 		expected *kraanv1alpha1.AddonsLayerStatus
 	}
 
-	l, e := getLayer(emptyStatus, layersData)
+	l, e := getLayer(emptyStatus, layersData, reposData)
 	if e != nil {
 		t.Fatalf("failed to create layer, error: %s", e.Error())
 	}
@@ -274,11 +302,10 @@ func TestSetStatusSetting(t *testing.T) { // nolint:funlen // ok
 		expected: &kraanv1alpha1.AddonsLayerStatus{
 			State:   kraanv1alpha1.K8sVersionCondition,
 			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{{
-				Status:  corev1.ConditionTrue,
-				Version: versionOne,
+			Conditions: []metav1.Condition{{
+				Status:  metav1.ConditionTrue,
 				Type:    kraanv1alpha1.K8sVersionCondition,
-				Reason:  kraanv1alpha1.AddonsLayerK8sVersionReason,
+				Reason:  kraanv1alpha1.K8sVersionCondition,
 				Message: kraanv1alpha1.AddonsLayerK8sVersionMsg},
 			},
 		}}, {
@@ -287,11 +314,10 @@ func TestSetStatusSetting(t *testing.T) { // nolint:funlen // ok
 		expected: &kraanv1alpha1.AddonsLayerStatus{
 			State:   kraanv1alpha1.PruningCondition,
 			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{{
-				Status:  corev1.ConditionTrue,
-				Version: versionOne,
+			Conditions: []metav1.Condition{{
+				Status:  metav1.ConditionTrue,
 				Type:    kraanv1alpha1.PruningCondition,
-				Reason:  kraanv1alpha1.AddonsLayerPruningReason,
+				Reason:  kraanv1alpha1.PruningCondition,
 				Message: kraanv1alpha1.AddonsLayerPruningMsg},
 			},
 		}}, {
@@ -300,11 +326,10 @@ func TestSetStatusSetting(t *testing.T) { // nolint:funlen // ok
 		expected: &kraanv1alpha1.AddonsLayerStatus{
 			State:   kraanv1alpha1.ApplyingCondition,
 			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{{
-				Status:  corev1.ConditionTrue,
-				Version: versionOne,
+			Conditions: []metav1.Condition{{
+				Status:  metav1.ConditionTrue,
 				Type:    kraanv1alpha1.ApplyingCondition,
-				Reason:  kraanv1alpha1.AddonsLayerApplyingReason,
+				Reason:  kraanv1alpha1.ApplyingCondition,
 				Message: kraanv1alpha1.AddonsLayerApplyingMsg},
 			},
 		}}, {
@@ -313,12 +338,11 @@ func TestSetStatusSetting(t *testing.T) { // nolint:funlen // ok
 		expected: &kraanv1alpha1.AddonsLayerStatus{
 			State:   kraanv1alpha1.DeployedCondition,
 			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{{
-				Status:  corev1.ConditionTrue,
-				Version: versionOne,
+			Conditions: []metav1.Condition{{
+				Status:  metav1.ConditionTrue,
 				Type:    kraanv1alpha1.DeployedCondition,
-				Reason:  "AddonsLayer version 0.1.01 is Deployed",
-				Message: ""},
+				Reason:  kraanv1alpha1.DeployedCondition,
+				Message: "AddonsLayer version 0.1.01 is Deployed, All HelmReleases deployed"},
 			},
 		}},
 	}
@@ -335,33 +359,29 @@ func TestSetStatusSetting(t *testing.T) { // nolint:funlen // ok
 func TestSetStatusUpdate(t *testing.T) {
 	type testsData struct {
 		status   string
-		reason   string
 		message  string
 		expected *kraanv1alpha1.AddonsLayerStatus
 	}
 
 	const (
-		reason  = "the reason"
 		message = "the message"
 	)
 
-	l, e := getLayer(emptyStatus, layersData)
+	l, e := getLayer(emptyStatus, layersData, reposData)
 	if e != nil {
 		t.Fatalf("failed to create layer, error: %s", e.Error())
 	}
 
 	tests := []testsData{{
 		status:  kraanv1alpha1.ApplyingCondition,
-		reason:  reason,
 		message: message,
 		expected: &kraanv1alpha1.AddonsLayerStatus{
 			State:   kraanv1alpha1.ApplyingCondition,
 			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{{
-				Status:  corev1.ConditionTrue,
-				Version: versionOne,
+			Conditions: []metav1.Condition{{
+				Status:  metav1.ConditionTrue,
 				Type:    kraanv1alpha1.ApplyingCondition,
-				Reason:  reason,
+				Reason:  kraanv1alpha1.ApplyingCondition,
 				Message: message},
 			},
 		}},
@@ -369,7 +389,7 @@ func TestSetStatusUpdate(t *testing.T) {
 
 	for number, test := range tests {
 		resetConditions(l)
-		l.StatusUpdate(test.status, test.reason, test.message)
+		l.StatusUpdate(test.status, test.message)
 		if err := compareStatus(l.GetFullStatus(), test.expected); err != nil {
 			t.Fatalf("test: %d, failed, error: %s", number+1, err.Error())
 		}
@@ -392,17 +412,16 @@ func TestHold(t *testing.T) {
 		status: &kraanv1alpha1.AddonsLayerStatus{
 			State:   kraanv1alpha1.HoldCondition,
 			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{{
-				Status:  corev1.ConditionTrue,
-				Version: versionOne,
+			Conditions: []metav1.Condition{{
+				Status:  metav1.ConditionTrue,
 				Type:    kraanv1alpha1.HoldCondition,
-				Reason:  kraanv1alpha1.AddonsLayerHoldReason,
+				Reason:  kraanv1alpha1.HoldCondition,
 				Message: kraanv1alpha1.AddonsLayerHoldMsg},
 			},
 		}},
 	}
 	for number, test := range tests {
-		l, e := getLayer(test.layerName, layersData)
+		l, e := getLayer(test.layerName, layersData, reposData)
 		if e != nil {
 			t.Fatalf("failed to create layer, error: %s", e.Error())
 		}
@@ -480,80 +499,10 @@ func TestHold(t *testing.T) {
 				Reason:  kraanv1alpha1.AddonsLayerK8sVersionReason,
 				Message: kraanv1alpha1.AddonsLayerK8sVersionMsg},
 			},
-		}}, {
-		name:      "set status when maximum number of conditions already",
-		layerName: maxConditions,
-		status:    kraanv1alpha1.PruningCondition,
-		reason:    kraanv1alpha1.AddonsLayerPruningReason,
-		message:   kraanv1alpha1.AddonsLayerPruningMsg,
-		expected: &kraanv1alpha1.AddonsLayerStatus{
-			State:   kraanv1alpha1.PruningCondition,
-			Version: versionOne,
-			Conditions: []kraanv1alpha1.Condition{
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.PruningCondition,
-					Reason:  kraanv1alpha1.AddonsLayerPruningReason,
-					Message: kraanv1alpha1.AddonsLayerPruningMsg},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.ApplyPendingCondition,
-					Reason:  "waiting for layer: test-layer2, version: 0.1.01 to be applied.",
-					Message: "Layer: test-layer2, current state: Applying."},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.ApplyingCondition,
-					Reason:  kraanv1alpha1.AddonsLayerApplyingReason,
-					Message: kraanv1alpha1.AddonsLayerApplyingMsg},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.DeployedCondition,
-					Reason:  kraanv1alpha1.AddonsLayerDeployedReason,
-					Message: ""},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.K8sVersionCondition,
-					Reason:  kraanv1alpha1.AddonsLayerK8sVersionReason,
-					Message: kraanv1alpha1.AddonsLayerK8sVersionMsg},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.PruningCondition,
-					Reason:  kraanv1alpha1.AddonsLayerPruningReason,
-					Message: kraanv1alpha1.AddonsLayerPruningMsg},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.ApplyPendingCondition,
-					Reason:  "waiting for layer: test-layer2, version: 0.1.01 to be applied.",
-					Message: "Layer: test-layer2, current state: Applying."},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.ApplyingCondition,
-					Reason:  kraanv1alpha1.AddonsLayerApplyingReason,
-					Message: kraanv1alpha1.AddonsLayerApplyingMsg},
-				{
-					Status:  corev1.ConditionFalse,
-					Version: versionOne,
-					Type:    kraanv1alpha1.DeployedCondition,
-					Reason:  kraanv1alpha1.AddonsLayerDeployedReason,
-					Message: ""},
-				{
-					Status:  corev1.ConditionTrue,
-					Version: versionOne,
-					Type:    kraanv1alpha1.PruningCondition,
-					Reason:  kraanv1alpha1.AddonsLayerPruningReason,
-					Message: kraanv1alpha1.AddonsLayerPruningMsg},
-			}}}}
+		}}}
 
 	for _, test := range tests {
-		l, e := getLayer(test.layerName, layersData)
+		l, e := getLayer(test.layerName, layersData, reposData)
 		if e != nil {
 			t.Fatalf("test: %s, failed to create layer, error: %s", test.name, e.Error())
 		}
@@ -610,7 +559,7 @@ func TestCheckK8sVersion(t *testing.T) { // nolint:funlen // ok
 	}
 
 	for _, test := range tests {
-		l, e := getLayer(test.layerName, layersData)
+		l, e := getLayer(test.layerName, layersData, reposData)
 		if e != nil {
 			t.Fatalf("test: %s, failed to create layer, error: %s", test.name, e.Error())
 		}
@@ -632,7 +581,7 @@ func TestCheckK8sVersion(t *testing.T) { // nolint:funlen // ok
 	}
 }
 
-func TestDependenciesDeployed(t *testing.T) {
+func TestDependenciesDeployed(t *testing.T) { // nolint: funlen // ok
 	type testsData struct {
 		name       string
 		layerName  string
@@ -670,11 +619,36 @@ func TestDependenciesDeployed(t *testing.T) {
 		layerName:  twoDepends,
 		layersData: layersData2,
 		expected:   false,
+	}, {
+		name:       "check dependencies with one dependsOn, observed Generation not equal to generation",
+		layerName:  oneDependsG,
+		layersData: layersData1,
+		expected:   false,
+	}, {
+		name:       "check dependencies with one dependsOn, dependency source observed Generation not equal to generation",
+		layerName:  oneDependsSG,
+		layersData: layersData1,
+		expected:   false,
+	}, {
+		name:       "check dependencies with one dependsOn, dependency source revision not equal to deployed revision",
+		layerName:  oneDependsSR,
+		layersData: layersData1,
+		expected:   false,
+	}, {
+		name:       "check dependencies with one dependsOn, dependency not deployed",
+		layerName:  oneDependsND,
+		layersData: layersData1,
+		expected:   false,
+	}, {
+		name:       "check dependencies with one dependsOn, dependency source not ready",
+		layerName:  oneDependsSNR,
+		layersData: layersData1,
+		expected:   false,
 	},
 	}
 
 	for _, test := range tests {
-		l, e := getLayer(test.layerName, test.layersData)
+		l, e := getLayer(test.layerName, test.layersData, reposData)
 		if e != nil {
 			t.Fatalf("test: %s, failed to create layer, error: %s", test.name, e.Error())
 		}

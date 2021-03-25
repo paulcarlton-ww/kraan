@@ -6,9 +6,10 @@ spec:
   version: 0.1.01
   hold: false
   interval: 1m
+  timeout: 30s
   source:
     name: addons-config
-    namespace: gitops-system
+    namespace: gotk-system
     path: ./testdata/addons/bootstrap
   prereqs:
       k8sVersion: "v1.16"
@@ -17,12 +18,16 @@ apiVersion: kraan.io/v1alpha1
 kind: AddonsLayer
 metadata:
   name: base
+  finalizers:
+    - finalizers.kraan.io
 spec:
   version: 0.1.01
   interval: 1m
-  source: 
+  timeout: 30s
+  source:
+    kind: gitrepositories.source.toolkit.fluxcd.io
     name: addons-config
-    namespace: gitops-system
+    namespace: gotk-system
     path: ./testdata/addons/base
   prereqs:
       k8sVersion: "v1.16"
@@ -35,10 +40,11 @@ metadata:
   name: mgmt
 spec:
   interval: 1m
+  timeout: 30s
   version: 0.1.01
   source: 
     name: addons-config
-    namespace: gitops-system
+    namespace: gotk-system
     path: ./testdata/addons/mgmt
   prereqs:
       k8sVersion: "v1.16"
@@ -51,9 +57,11 @@ metadata:
   name: apps
 spec:
   version: 0.1.01
+  interval: 1m
+  timeout: 30s
   source: 
     name: addons-config
-    namespace: gitops-system
+    namespace: gotk-system
     path: ./testdata/addons/apps
   prereqs:
       k8sVersion: "v1.16"

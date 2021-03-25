@@ -24,30 +24,39 @@ import (
 
 	// +kubebuilder:scaffold:imports
 
-	helmopv1 "github.com/fluxcd/helm-operator/pkg/apis/helm.fluxcd.io/v1"
-	sourcev1 "github.com/fluxcd/source-controller/api/v1alpha1"
+	helmctlv2 "github.com/fluxcd/helm-controller/api/v2beta1"
+	sourcev1 "github.com/fluxcd/source-controller/api/v1beta1"
+	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
+	uzap "go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	corev1 "k8s.io/api/core/v1"
+	extv1b1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	_ "sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	kraanv1alpha1 "github.com/fidelity/kraan/api/v1alpha1"
 	"github.com/fidelity/kraan/controllers"
+	"github.com/fidelity/kraan/pkg/common"
 	"github.com/fidelity/kraan/pkg/repos"
 )
 
 var (
 	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	setupLog = log.Log.WithName("initialization")
 )
 
 func init() {
+	log.SetLogger(zap.New())
 	_ = corev1.AddToScheme(scheme)        // nolint:errcheck // ok
-	_ = helmopv1.AddToScheme(scheme)      // nolint:errcheck // ok
+	_ = helmctlv2.AddToScheme(scheme)     // nolint:errcheck // ok
 	_ = kraanv1alpha1.AddToScheme(scheme) // nolint:errcheck // ok
 	_ = sourcev1.AddToScheme(scheme)      // nolint:errcheck // ok
+	_ = extv1b1.AddToScheme(scheme)       // nolint:errcheck // ok
 	// +kubebuilder:scaffold:scheme
 
 	if path, set := os.LookupEnv("DATA_PATH"); set {
@@ -66,17 +75,50 @@ func init() {
 	}
 }
 
-func main() {
+type LogLevels struct {
+	Info    bool
+	Debug   bool
+	Trace   bool
+	Highest int
+}
+
+func CheckLogLevels(log logr.Logger) LogLevels {
+	lvl := LogLevels{
+		Info:  log.V(0).Enabled(),
+		Debug: log.V(1).Enabled(),
+		Trace: log.V(2).Enabled(),
+	}
+	for i := 0; i < 100; i++ {
+		if !log.V(i).Enabled() {
+			log.V(i).Info("log-level enabled", "level", i)
+			lvl.Highest = i - 1
+			break
+		}
+	}
+	return lvl
+}
+
+// NewLogger returns a logger configured the timestamps format is ISO8601
+func NewLogger(logOpts *zap.Options) logr.Logger {
+	encCfg := uzap.NewProductionEncoderConfig()
+	encCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	encoder := zap.Encoder(zapcore.NewJSONEncoder(encCfg))
+
+	return zap.New(zap.UseFlagOptions(logOpts), encoder).WithName("kraan")
+}
+
+func main() { //nolint:funlen // ok
 	var (
 		metricsAddr             string
 		healthAddr              string
 		enableLeaderElection    bool
 		leaderElectionNamespace string
-		logJSON                 bool
-		syncPeriodStr           string
+		logLevel                string
+		concurrent              int
+		syncPeriod              time.Duration
 	)
 
-	flag.StringVar(&metricsAddr, "metrics-addr", ":8282", "The address the metric endpoint binds to.")
+	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(
 		&leaderElectionNamespace,
 		"leader-election-namespace",
@@ -87,35 +129,64 @@ func main() {
 	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&logJSON, "log-json", false, "Set logging to JSON format.")
-
+	flag.IntVar(&concurrent, "concurrent", 4, "The number of concurrent reconciles per controller.")
+	flag.StringVar(&logLevel, "log-level", "info", "Set logging level. Can be debug, info or error.")
 	flag.StringVar(&healthAddr,
 		"health-addr",
 		":9440",
 		"The address the health endpoint binds to.",
 	)
 
-	flag.StringVar(
-		&syncPeriodStr,
+	flag.DurationVar(
+		&syncPeriod,
 		"sync-period",
-		"30s",
+		time.Second*60,
 		"period between reprocessing of all AddonsLayers.",
 	)
 
+	logOpts := zap.Options{}
+	logOpts.BindFlags(flag.CommandLine)
+
 	flag.Parse()
 
-	syncPeriod, err := time.ParseDuration(syncPeriodStr)
-	if err != nil {
-		setupLog.Error(err, "unable to parse sync period")
+	setupLog.Info("command-line flags", "osArgs", os.Args[:1])
+	logger := NewLogger(&logOpts)
+
+	loggerType := fmt.Sprintf("%T", logger)
+	lvl := CheckLogLevels(logger)
+	setupLog.Info("logger configured", "loggerType", loggerType, "logLevels", lvl)
+
+	if common.GetRuntimeNamespace() == "" {
+		setupLog.Error(fmt.Errorf("RUNTIME_NAMESPACE environmental variable not set"), "please set RUNTIME_NAMESPACE environmental variable to Kraan Controller namespace")
 		os.Exit(1)
 	}
-	ctrl.SetLogger(zap.New(zap.UseDevMode(!logJSON)))
 
-	mgr, err := createManager(metricsAddr, healthAddr, enableLeaderElection, leaderElectionNamespace, syncPeriod)
+	mgr, err := createManager(metricsAddr, healthAddr, enableLeaderElection, leaderElectionNamespace, syncPeriod, logger)
 	if err != nil {
 		setupLog.Error(err, "problem creating manager")
 		os.Exit(1)
 	}
+
+	r, err := controllers.NewReconciler(
+		mgr.GetConfig(),
+		mgr.GetClient(),
+		logger.WithName("controller"),
+		mgr.GetScheme())
+	if err != nil {
+		setupLog.Error(err, "unable to create Reconciler")
+		os.Exit(1)
+	}
+
+	err = r.SetupWithManagerAndOptions(mgr, controllers.AddonsLayerReconcilerOptions{
+		MaxConcurrentReconciles: concurrent,
+	})
+	// +kubebuilder:scaffold:builder
+	if err != nil {
+		setupLog.Error(err, "unable to setup Reconciler with Manager")
+		os.Exit(1)
+	}
+
+	// +kubebuilder:scaffold:builder
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
@@ -124,59 +195,40 @@ func main() {
 	}
 }
 
-func createManager(metricsAddr string, healthAddr string, enableLeaderElection bool, leaderElectionNamespace string, syncPeriod time.Duration) (manager.Manager, error) {
+func createManager(metricsAddr string, healthAddr string, enableLeaderElection bool,
+	leaderElectionNamespace string, syncPeriod time.Duration, logger logr.Logger) (manager.Manager, error) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Logger:                  logger.WithName("manager"),
 		Scheme:                  scheme,
 		MetricsBindAddress:      metricsAddr,
 		HealthProbeBindAddress:  healthAddr,
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionNamespace: leaderElectionNamespace,
 		LeaderElectionID:        "925331a6.kraan.io",
-		Namespace:               os.Getenv("RUNTIME_NAMESPACE"),
+		Namespace:               "",
 		SyncPeriod:              &syncPeriod,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("unable to start manager: %w", err)
-	}
-
-	if err := createController(mgr); err != nil {
-		return nil, fmt.Errorf("unable to create controller: %w", err)
+		return nil, errors.Wrap(err, "unable to start manager")
 	}
 
 	if err := mgr.AddReadyzCheck("ping", readinessCheck); err != nil {
-		return nil, fmt.Errorf("unable to create ready check: %w", err)
+		return nil, errors.Wrap(err, "unable to create ready check")
 	}
 
 	if err := mgr.AddHealthzCheck("ping", livenessCheck); err != nil {
-		return nil, fmt.Errorf("unable to create health check: %w", err)
+		return nil, errors.Wrap(err, "unable to create health check")
 	}
 
 	return mgr, nil
 }
 
-func createController(mgr manager.Manager) error {
-	r, err := controllers.NewReconciler(
-		mgr.GetConfig(),
-		mgr.GetClient(),
-		ctrl.Log.WithName("controllers").WithName("AddonsLayer"),
-		mgr.GetScheme())
-	if err != nil {
-		return fmt.Errorf("unable to create Reconciler: %w", err)
-	}
-	err = r.SetupWithManager(mgr)
-	// +kubebuilder:scaffold:builder
-	if err != nil {
-		return fmt.Errorf("unable to setup Reconciler with Manager: %w", err)
-	}
-	return nil
-}
-
 func readinessCheck(req *http.Request) error {
-	setupLog.Info(fmt.Sprintf("got readiness check: %s", req.Header))
+	setupLog.V(2).Info("got readiness check", "header", req.Header)
 	return nil
 }
 
 func livenessCheck(req *http.Request) error {
-	setupLog.Info(fmt.Sprintf("got liveness check: %s", req.Header))
+	setupLog.V(2).Info("got liveness check", "header", req.Header)
 	return nil
 }
